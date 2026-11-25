@@ -49,3 +49,10 @@ cargo run
 ```bash
 cargo test
 ```
+
+## GitHub Actions 手动打包（Linux x86_64）
+
+仓库已配置 [.github/workflows/release-linux.yml](.github/workflows/release-linux.yml)，仅在 GitHub Actions 页面点击 **Run workflow** 时手动触发，编译零外部依赖的 `linux-x86_64` 静态单二进制包（`x86_64-unknown-linux-musl`，前端与 SQLite 均已内嵌）：
+
+- 默认直接生成并上传 `chat-rs-linux-x86_64.tar.gz`（可在 Actions 运行详情页下载 Artifacts）。
+- 若手动运行时填写了可选的 `release_tag`（如 `v0.1.0`），还会自动创建对应的 GitHub Release。

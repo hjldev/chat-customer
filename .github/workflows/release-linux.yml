@@ -1,0 +1,81 @@
+name: Build Linux x86_64
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "可选：填写版本号（如 v0.1.0）则顺便发布 GitHub Release，留空仅上传产物"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  build:
+    name: Build (linux-x86_64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Set up cross-compilation toolchain
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ env.TARGET }}
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ env.TARGET }}
+
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/chat-rs"
+          file "$BIN"
+          mkdir -p dist/pkg
+          cp "$BIN" dist/pkg/chat-rs
+          cp README.md dist/pkg/README.md
+          chmod +x dist/pkg/chat-rs
+          ARCHIVE="chat-rs-linux-x86_64.tar.gz"
+          tar -czf "dist/${ARCHIVE}" -C dist/pkg .
+          (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          rm -rf dist/pkg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chat-rs-linux-x86_64
+          path: |
+            dist/chat-rs-linux-x86_64.tar.gz
+            dist/chat-rs-linux-x86_64.tar.gz.sha256
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          generate_release_notes: true
+          files: |
+            dist/chat-rs-linux-x86_64.tar.gz
+            dist/chat-rs-linux-x86_64.tar.gz.sha256
