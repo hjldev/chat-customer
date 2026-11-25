@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>消息收件箱 - 回复访客</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <!-- Login View -->
+  <div class="login-shell" id="loginShell">
+    <div class="login-card">
+      <h1>消息收件箱</h1>
+      <p>输入管理密码，实时接收并回复访客发来的消息。</p>
+      <form id="loginForm">
+        <div class="field">
+          <label for="passwordInput">管理密码</label>
+          <input id="passwordInput" type="password" placeholder="请输入管理密码" required autofocus />
+        </div>
+        <button class="btn btn-primary" type="submit" style="width:100%;">进入收件箱</button>
+        <div class="error-text" id="loginError"></div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Admin Workbench -->
+  <div class="admin-shell hidden" id="adminShell">
+    <aside class="sidebar">
+      <div class="sidebar-top">
+        <div class="sidebar-brand">
+          <span class="dot" id="wsDot"></span>
+          <span>收件箱</span>
+          <span class="badge hidden" id="totalUnreadBadge">0</span>
+        </div>
+        <div style="display:flex;gap:4px;">
+          <button class="btn btn-ghost btn-sm" id="soundBtn" type="button" title="新消息提示音">🔔</button>
+          <button class="btn btn-ghost btn-sm" id="statsBtn" type="button" title="缓存与连接状态">缓存</button>
+          <button class="btn btn-ghost btn-sm" id="logoutBtn" type="button" title="退出登录">退出</button>
+        </div>
+      </div>
+
+      <div class="sidebar-tools">
+        <input class="search-input" id="searchInput" type="text" placeholder="搜索访客昵称、联系方式或消息..." />
+        <div class="filter-tabs" id="filterTabs">
+          <button class="filter-tab active" data-filter="open" type="button">进行中</button>
+          <button class="filter-tab" data-filter="all" type="button">全部</button>
+          <button class="filter-tab" data-filter="archived" type="button">已归档</button>
+        </div>
+      </div>
+
+      <div class="session-list" id="sessionList"></div>
+    </aside>
+
+    <section class="main-pane">
+      <div class="empty-pane" id="emptyPane">
+        <h2>等待接收访客消息</h2>
+        <p>把下方链接发给其他人，对方打开网页即可直接向你发消息，你会在这里实时收到并回复。</p>
+        <div class="share-box">
+          <code id="visitorLinkText"></code>
+          <button class="btn btn-sm" id="copyLinkBtn" type="button">复制链接</button>
+          <a class="btn btn-sm" href="/" target="_blank" style="text-decoration:none;">打开访客页</a>
+        </div>
+      </div>
+
+      <div class="chat-pane hidden" id="chatPane">
+        <header class="chat-header">
+          <div class="peer-info">
+            <button class="btn btn-sm mobile-only" id="backBtn" type="button">← 返回</button>
+            <div class="avatar visitor-avatar" id="activeAvatar">
+              <span id="activeAvatarText">访</span>
+              <span class="avatar-dot" id="activeAvatarDot"></span>
+            </div>
+            <div style="min-width:0;">
+              <div class="peer-title" id="activeName">访客</div>
+              <div class="peer-sub" id="activeMeta"></div>
+            </div>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-sm" id="archiveBtn" type="button">归档</button>
+            <button class="btn btn-danger btn-sm" id="deleteBtn" type="button">删除</button>
+          </div>
+        </header>
+
+        <main class="messages-area" id="messagesArea"></main>
+        <div class="typing-bar" id="typingBar"></div>
+
+        <div class="quick-chips" id="quickReplies">
+          <button class="chip" type="button">你好，我在线，请问有什么可以帮你？</button>
+          <button class="chip" type="button">收到，我马上看一下并回复你！</button>
+          <button class="chip" type="button">方便留一下你的邮箱或微信吗？</button>
+        </div>
+
+        <form class="composer" id="replyForm">
+          <textarea
+            id="replyInput"
+            rows="1"
+            placeholder="输入回复内容..."
+          ></textarea>
+          <button class="btn btn-primary" type="submit">回复</button>
+        </form>
+      </div>
+    </section>
+  </div>
+
+  <!-- Cache Stats Modal -->
+  <div class="modal-backdrop hidden" id="statsModal">
+    <div class="modal-card">
+      <div class="modal-title">应用缓存与实时连接监控</div>
+      <div class="stats-grid" id="statsGrid"></div>
+      <div style="font-size:12px;color:var(--text-muted);line-height:1.6;">
+        底层采用 SQLite（WAL 模式）持久化 + Moka 内存缓存（Cache-Aside 读 + Write-Through 写），高频会话与消息读取直接命中应用缓存。
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="refreshStatsBtn" type="button">刷新数据</button>
+        <button class="btn btn-primary" id="closeStatsBtn" type="button">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const TOKEN_KEY = 'chat_rs_admin_token_v1';
+
+    const state = {
+      token: localStorage.getItem(TOKEN_KEY) || '',
+      ownerName: '我',
+      sessions: new Map(),
+      activeSessionId: null,
+      messages: [],
+      seenMessageIds: new Set(),
+      filter: 'open',
+      search: '',
+      soundEnabled: true,
+      ws: null,
+      reconnectTimer: null,
+      typingTimer: null,
+      isTypingSent: false,
+    };
+
+    const el = {
+      loginShell: document.getElementById('loginShell'),
+      loginForm: document.getElementById('loginForm'),
+      passwordInput: document.getElementById('passwordInput'),
+      loginError: document.getElementById('loginError'),
+      adminShell: document.getElementById('adminShell'),
+      wsDot: document.getElementById('wsDot'),
+      totalUnreadBadge: document.getElementById('totalUnreadBadge'),
+      soundBtn: document.getElementById('soundBtn'),
+      statsBtn: document.getElementById('statsBtn'),
+      logoutBtn: document.getElementById('logoutBtn'),
+      searchInput: document.getElementById('searchInput'),
+      filterTabs: document.getElementById('filterTabs'),
+      sessionList: document.getElementById('sessionList'),
+      emptyPane: document.getElementById('emptyPane'),
+      chatPane: document.getElementById('chatPane'),
+      visitorLinkText: document.getElementById('visitorLinkText'),
+      copyLinkBtn: document.getElementById('copyLinkBtn'),
+      backBtn: document.getElementById('backBtn'),
+      activeAvatarText: document.getElementById('activeAvatarText'),
+      activeAvatarDot: document.getElementById('activeAvatarDot'),
+      activeName: document.getElementById('activeName'),
+      activeMeta: document.getElementById('activeMeta'),
+      archiveBtn: document.getElementById('archiveBtn'),
+      deleteBtn: document.getElementById('deleteBtn'),
+      messagesArea: document.getElementById('messagesArea'),
+      typingBar: document.getElementById('typingBar'),
+      quickReplies: document.getElementById('quickReplies'),
+      replyForm: document.getElementById('replyForm'),
+      replyInput: document.getElementById('replyInput'),
+      statsModal: document.getElementById('statsModal'),
+      statsGrid: document.getElementById('statsGrid'),
+      refreshStatsBtn: document.getElementById('refreshStatsBtn'),
+      closeStatsBtn: document.getElementById('closeStatsBtn'),
+    };
+
+    el.visitorLinkText.textContent = `${location.origin}/`;
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str || '';
+      return div.innerHTML;
+    }
+
+    function formatTime(iso) {
+      if (!iso) return '';
+      const d = new Date(iso);
+      const now = new Date();
+      if (d.toDateString() === now.toDateString()) {
+        return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+      }
+      return d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' }) + ' ' +
+        d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function playChime() {
+      if (!state.soundEnabled) return;
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(660, ctx.currentTime + 0.14);
+        gain.gain.setValueAtTime(0.08, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.22);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.22);
+      } catch {}
+    }
+
+    async function apiFetch(url, options = {}) {
+      const headers = Object.assign({}, options.headers || {}, {
+        Authorization: `Bearer ${state.token}`,
+      });
+      const res = await fetch(url, Object.assign({}, options, { headers }));
+      if (res.status === 401) {
+        handleLogout(false);
+        throw new Error('Unauthorized');
+      }
+      return res;
+    }
+
+    function showLogin() {
+      el.loginShell.style.display = 'flex';
+      el.adminShell.classList.add('hidden');
+    }
+
+    function showWorkbench() {
+      el.loginShell.style.display = 'none';
+      el.adminShell.classList.remove('hidden');
+    }
+
+    function sortedSessions() {
+      const q = state.search.trim().toLowerCase();
+      return Array.from(state.sessions.values())
+        .filter((s) => {
+          if (state.filter !== 'all' && s.status !== state.filter) return false;
+          if (!q) return true;
+          return (
+            (s.visitor_name || '').toLowerCase().includes(q) ||
+            (s.visitor_contact || '').toLowerCase().includes(q) ||
+            (s.last_message || '').toLowerCase().includes(q)
+          );
+        })
+        .sort((a, b) => {
+          const ta = a.last_message_at || a.created_at;
+          const tb = b.last_message_at || b.created_at;
+          return tb.localeCompare(ta);
+        });
+    }
+
+    function updateUnreadSummary() {
+      let total = 0;
+      for (const s of state.sessions.values()) {
+        if (s.status === 'open') total += s.unread_count || 0;
+      }
+      if (total > 0) {
+        el.totalUnreadBadge.textContent = total > 99 ? '99+' : String(total);
+        el.totalUnreadBadge.classList.remove('hidden');
+        document.title = `(${total}) 消息收件箱`;
+      } else {
+        el.totalUnreadBadge.classList.add('hidden');
+        document.title = '消息收件箱 - 回复访客';
+      }
+    }
+
+    function renderSessionList() {
+      updateUnreadSummary();
+      const list = sortedSessions();
+      if (list.length === 0) {
+        el.sessionList.innerHTML = '<div class="empty-list">暂无会话</div>';
+        return;
+      }
+
+      el.sessionList.innerHTML = list
+        .map((s) => {
+          const active = s.id === state.activeSessionId ? 'active' : '';
+          const onlineCls = s.online ? 'online' : '';
+          const initial = (s.visitor_name || '访').slice(0, 1);
+          const previewPrefix = s.last_message_sender === 'owner' ? '我: ' : '';
+          const preview = s.last_message ? `${previewPrefix}${s.last_message}` : '新访客进入对话';
+          const unreadHtml = s.unread_count > 0
+            ? `<span class="badge">${s.unread_count > 99 ? '99+' : s.unread_count}</span>`
+            : '';
+          return `
+            <div class="session-item ${active}" data-id="${escapeHtml(s.id)}">
+              <div class="avatar visitor-avatar">
+                <span>${escapeHtml(initial)}</span>
+                <span class="avatar-dot ${onlineCls}"></span>
+              </div>
+              <div class="session-body">
+                <div class="session-row-top">
+                  <span class="session-name">${escapeHtml(s.visitor_name)}</span>
+                  <span class="session-time">${formatTime(s.last_message_at || s.created_at)}</span>
+                </div>
+                <div class="session-row-bottom">
+                  <span class="session-preview">${escapeHtml(preview)}</span>
+                  ${unreadHtml}
+                </div>
+              </div>
+            </div>
+          `;
+        })
+        .join('');
+    }
+
+    function renderActiveHeader() {
+      const s = state.sessions.get(state.activeSessionId);
+      if (!s) {
+        el.emptyPane.classList.remove('hidden');
+        el.chatPane.classList.add('hidden');
+        el.adminShell.classList.remove('has-active');
+        return;
+      }
+
+      el.emptyPane.classList.add('hidden');
+      el.chatPane.classList.remove('hidden');
+      el.adminShell.classList.add('has-active');
+
+      el.activeAvatarText.textContent = (s.visitor_name || '访').slice(0, 1);
+      el.activeAvatarDot.classList.toggle('online', !!s.online);
+      el.activeName.textContent = s.visitor_name;
+
+      const metaParts = [s.online ? '在线' : '离线'];
+      if (s.visitor_contact) metaParts.push(`联系: ${s.visitor_contact}`);
+      if (s.visitor_meta) metaParts.push(s.visitor_meta);
+      el.activeMeta.textContent = metaParts.join(' · ');
+      el.archiveBtn.textContent = s.status === 'archived' ? '重新打开' : '归档';
+    }
+
+    function renderMessages() {
+      if (state.messages.length === 0) {
+        el.messagesArea.innerHTML = '<div class="empty-list">该访客尚未发送消息，你也可以主动打个招呼。</div>';
+        return;
+      }
+
+      const s = state.sessions.get(state.activeSessionId);
+      const visitorName = s ? s.visitor_name : '访客';
+
+      el.messagesArea.innerHTML = state.messages
+        .map((m) => {
+          const isOwner = m.sender === 'owner';
+          const cls = isOwner ? 'outgoing' : 'incoming';
+          const label = isOwner ? state.ownerName : visitorName;
+          return `
+            <div class="msg-row ${cls}">
+              <div class="msg-bubble">${escapeHtml(m.content)}</div>
+              <div class="msg-meta">${escapeHtml(label)} · ${formatTime(m.created_at)}</div>
+            </div>
+          `;
+        })
+        .join('');
+
+      el.messagesArea.scrollTop = el.messagesArea.scrollHeight;
+    }
+
+    async function loadSessions() {
+      const res = await apiFetch('/api/admin/sessions');
+      if (!res.ok) return;
+      const data = await res.json();
+      state.sessions.clear();
+      for (const s of data.sessions || []) {
+        state.sessions.set(s.id, s);
+      }
+      renderSessionList();
+      renderActiveHeader();
+    }
+
+    async function selectSession(sessionId) {
+      state.activeSessionId = sessionId;
+      el.typingBar.textContent = '';
+      renderSessionList();
+      renderActiveHeader();
+
+      const res = await apiFetch(`/api/admin/sessions/${encodeURIComponent(sessionId)}/messages`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.session) state.sessions.set(data.session.id, data.session);
+      state.messages = data.messages || [];
+      state.seenMessageIds = new Set(state.messages.map((m) => m.id));
+      renderActiveHeader();
+      renderMessages();
+
+      if (data.session && data.session.unread_count > 0) {
+        markRead(sessionId);
+      }
+      el.replyInput.focus();
+    }
+
+    async function markRead(sessionId) {
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: 'mark_read', session_id: sessionId }));
+      } else {
+        await apiFetch(`/api/admin/sessions/${encodeURIComponent(sessionId)}/read`, {
+          method: 'POST',
+        });
+      }
+      const s = state.sessions.get(sessionId);
+      if (s) {
+        s.unread_count = 0;
+        renderSessionList();
+      }
+    }
+
+    function connectAdminWs() {
+      if (state.ws) {
+        state.ws.onclose = null;
+        state.ws.close();
+      }
+      clearTimeout(state.reconnectTimer);
+
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${proto}//${location.host}/ws/admin?token=${encodeURIComponent(state.token)}`;
+      const ws = new WebSocket(wsUrl);
+      state.ws = ws;
+
+      ws.onopen = () => {
+        el.wsDot.classList.add('online');
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'new_message') {
+            state.sessions.set(data.session.id, data.session);
+
+            if (data.message.sender === 'visitor') {
+              playChime();
+            }
+
+            if (data.session.id === state.activeSessionId) {
+              if (!state.seenMessageIds.has(data.message.id)) {
+                state.seenMessageIds.add(data.message.id);
+                state.messages.push(data.message);
+                renderMessages();
+              }
+              if (data.message.sender === 'visitor') {
+                el.typingBar.textContent = '';
+                markRead(data.session.id);
+              }
+            }
+            renderSessionList();
+            renderActiveHeader();
+          } else if (data.type === 'session_updated') {
+            state.sessions.set(data.session.id, data.session);
+            renderSessionList();
+            if (data.session.id === state.activeSessionId) {
+              renderActiveHeader();
+            }
+          } else if (data.type === 'session_deleted') {
+            state.sessions.delete(data.session_id);
+            if (state.activeSessionId === data.session_id) {
+              state.activeSessionId = null;
+              state.messages = [];
+              state.seenMessageIds.clear();
+            }
+            renderSessionList();
+            renderActiveHeader();
+          } else if (data.type === 'presence' && data.session_id) {
+            const s = state.sessions.get(data.session_id);
+            if (s) {
+              s.online = !!data.visitor_online;
+              renderSessionList();
+              if (s.id === state.activeSessionId) renderActiveHeader();
+            }
+          } else if (data.type === 'typing' && data.session_id === state.activeSessionId && data.sender === 'visitor') {
+            el.typingBar.textContent = data.is_typing ? '访客正在输入...' : '';
+          }
+        } catch (err) {
+          console.error(err);
+        }
+      };
+
+      ws.onclose = () => {
+        el.wsDot.classList.remove('online');
+        if (state.token) {
+          state.reconnectTimer = setTimeout(connectAdminWs, 2500);
+        }
+      };
+    }
+
+    async function sendReply(text) {
+      const content = text.trim();
+      const sid = state.activeSessionId;
+      if (!content || !sid) return;
+
+      el.replyInput.value = '';
+      autoResize();
+      sendTyping(false);
+
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: 'send_message', session_id: sid, content }));
+        return;
+      }
+
+      const res = await apiFetch(`/api/admin/sessions/${encodeURIComponent(sid)}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        state.sessions.set(data.session.id, data.session);
+        if (!state.seenMessageIds.has(data.message.id)) {
+          state.seenMessageIds.add(data.message.id);
+          state.messages.push(data.message);
+        }
+        renderSessionList();
+        renderMessages();
+      }
+    }
+
+    function sendTyping(isTyping) {
+      if (!state.activeSessionId || state.isTypingSent === isTyping) return;
+      state.isTypingSent = isTyping;
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({
+          type: 'typing',
+          session_id: state.activeSessionId,
+          is_typing: isTyping,
+        }));
+      }
+    }
+
+    function syncPlaceholder() {
+      const isDesktop = window.matchMedia('(min-width: 821px) and (pointer: fine)').matches;
+      el.replyInput.placeholder = isDesktop
+        ? '输入回复内容，按 Enter 发送（Shift+Enter 换行）'
+        : '输入回复内容...';
+    }
+    syncPlaceholder();
+    window.addEventListener('resize', syncPlaceholder);
+
+    function autoResize() {
+      if (!el.replyInput.value) {
+        el.replyInput.style.height = '';
+        el.replyInput.style.overflowY = 'hidden';
+        return;
+      }
+      el.replyInput.style.height = 'auto';
+      const next = Math.min(el.replyInput.scrollHeight, 130);
+      el.replyInput.style.height = next + 'px';
+      el.replyInput.style.overflowY = el.replyInput.scrollHeight > 130 ? 'auto' : 'hidden';
+    }
+
+    async function loadStats() {
+      const res = await apiFetch('/api/admin/stats');
+      if (!res.ok) return;
+      const { stats } = await res.json();
+      el.statsGrid.innerHTML = `
+        <div class="stat-box">
+          <div class="stat-label">缓存命中率</div>
+          <div class="stat-value">${stats.hit_rate.toFixed(1)}%</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">命中 / 未命中</div>
+          <div class="stat-value">${stats.hits} / ${stats.misses}</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">已缓存会话 / 消息列表</div>
+          <div class="stat-value">${stats.cached_sessions} / ${stats.cached_message_lists}</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">在线访客 / 管理员连接</div>
+          <div class="stat-value">${stats.active_visitor_connections} / ${stats.active_admin_connections}</div>
+        </div>
+      `;
+    }
+
+    async function bootstrapAdmin() {
+      if (!state.token) {
+        showLogin();
+        return;
+      }
+      try {
+        const res = await apiFetch('/api/admin/me');
+        if (!res.ok) {
+          showLogin();
+          return;
+        }
+        const data = await res.json();
+        state.ownerName = data.owner_name || '我';
+        showWorkbench();
+        await loadSessions();
+        connectAdminWs();
+      } catch {
+        showLogin();
+      }
+    }
+
+    async function handleLogout(callApi = true) {
+      if (callApi && state.token) {
+        fetch('/api/admin/logout', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${state.token}` },
+        }).catch(() => {});
+      }
+      state.token = '';
+      localStorage.removeItem(TOKEN_KEY);
+      if (state.ws) {
+        state.ws.onclose = null;
+        state.ws.close();
+        state.ws = null;
+      }
+      clearTimeout(state.reconnectTimer);
+      showLogin();
+    }
+
+    // Event bindings
+    el.loginForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      el.loginError.textContent = '';
+      const password = el.passwordInput.value;
+      const res = await fetch('/api/admin/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        el.loginError.textContent = data.error || '密码错误';
+        return;
+      }
+      const data = await res.json();
+      state.token = data.token;
+      state.ownerName = data.owner_name || '我';
+      localStorage.setItem(TOKEN_KEY, state.token);
+      el.passwordInput.value = '';
+      showWorkbench();
+      await loadSessions();
+      connectAdminWs();
+    });
+
+    el.sessionList.addEventListener('click', (e) => {
+      const item = e.target.closest('.session-item');
+      if (item && item.dataset.id) {
+        selectSession(item.dataset.id);
+      }
+    });
+
+    el.searchInput.addEventListener('input', (e) => {
+      state.search = e.target.value;
+      renderSessionList();
+    });
+
+    el.filterTabs.addEventListener('click', (e) => {
+      const tab = e.target.closest('.filter-tab');
+      if (!tab) return;
+      state.filter = tab.dataset.filter;
+      for (const btn of el.filterTabs.querySelectorAll('.filter-tab')) {
+        btn.classList.toggle('active', btn === tab);
+      }
+      renderSessionList();
+    });
+
+    el.replyForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      sendReply(el.replyInput.value);
+    });
+
+    el.replyInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        sendReply(el.replyInput.value);
+      }
+    });
+
+    el.replyInput.addEventListener('input', () => {
+      autoResize();
+      sendTyping(true);
+      clearTimeout(state.typingTimer);
+      state.typingTimer = setTimeout(() => sendTyping(false), 1800);
+    });
+
+    el.quickReplies.addEventListener('click', (e) => {
+      if (e.target.classList.contains('chip')) {
+        sendReply(e.target.textContent);
+      }
+    });
+
+    el.archiveBtn.addEventListener('click', async () => {
+      const s = state.sessions.get(state.activeSessionId);
+      if (!s) return;
+      const nextStatus = s.status === 'archived' ? 'open' : 'archived';
+      const res = await apiFetch(`/api/admin/sessions/${encodeURIComponent(s.id)}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: nextStatus }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        state.sessions.set(data.session.id, data.session);
+        renderSessionList();
+        renderActiveHeader();
+      }
+    });
+
+    el.deleteBtn.addEventListener('click', async () => {
+      const sid = state.activeSessionId;
+      if (!sid) return;
+      if (!confirm('确定永久删除该会话及所有聊天记录吗？')) return;
+      const res = await apiFetch(`/api/admin/sessions/${encodeURIComponent(sid)}`, {
+        method: 'DELETE',
+      });
+      if (res.ok) {
+        state.sessions.delete(sid);
+        state.activeSessionId = null;
+        state.messages = [];
+        state.seenMessageIds.clear();
+        renderSessionList();
+        renderActiveHeader();
+      }
+    });
+
+    el.backBtn.addEventListener('click', () => {
+      state.activeSessionId = null;
+      renderSessionList();
+      renderActiveHeader();
+    });
+
+    el.soundBtn.addEventListener('click', () => {
+      state.soundEnabled = !state.soundEnabled;
+      el.soundBtn.textContent = state.soundEnabled ? '🔔' : '🔕';
+    });
+
+    el.statsBtn.addEventListener('click', async () => {
+      await loadStats();
+      el.statsModal.classList.remove('hidden');
+    });
+
+    el.refreshStatsBtn.addEventListener('click', loadStats);
+    el.closeStatsBtn.addEventListener('click', () => el.statsModal.classList.add('hidden'));
+    el.statsModal.addEventListener('click', (e) => {
+      if (e.target === el.statsModal) el.statsModal.classList.add('hidden');
+    });
+
+    el.logoutBtn.addEventListener('click', () => handleLogout(true));
+
+    el.copyLinkBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(`${location.origin}/`);
+        el.copyLinkBtn.textContent = '已复制';
+        setTimeout(() => (el.copyLinkBtn.textContent = '复制链接'), 1500);
+      } catch {}
+    });
+
+    setInterval(() => {
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 30000);
+
+    bootstrapAdmin();
+  </script>
+</body>
+</html>

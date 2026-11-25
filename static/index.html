@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>在线联系我</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="visitor-shell">
+    <div class="chat-card">
+      <header class="chat-header">
+        <div class="peer-info">
+          <div class="avatar" id="ownerAvatar">我</div>
+          <div>
+            <div class="peer-title" id="ownerName">在线联系我</div>
+            <div class="peer-sub">
+              <span class="dot" id="ownerDot"></span>
+              <span id="ownerStatusText">正在连接...</span>
+            </div>
+          </div>
+        </div>
+        <div class="header-actions">
+          <button class="btn btn-sm" id="profileBtn" type="button">完善称呼</button>
+        </div>
+      </header>
+
+      <main class="messages-area" id="messagesArea"></main>
+      <div class="typing-bar" id="typingBar"></div>
+
+      <div class="quick-chips" id="quickChips">
+        <button class="chip" type="button">你好，想向你咨询一个问题</button>
+        <button class="chip" type="button">有个合作想法想和你聊聊</button>
+        <button class="chip" type="button">我留一下联系方式，你方便时回复我</button>
+      </div>
+
+      <form class="composer" id="composerForm">
+        <textarea
+          id="msgInput"
+          rows="1"
+          placeholder="输入消息..."
+        ></textarea>
+        <button class="btn btn-primary" id="sendBtn" type="submit">发送</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Visitor Profile Modal -->
+  <div class="modal-backdrop hidden" id="profileModal">
+    <div class="modal-card">
+      <div class="modal-title">填写你的信息（选填）</div>
+      <form id="profileForm">
+        <div class="field">
+          <label for="visitorNameInput">你的称呼</label>
+          <input id="visitorNameInput" type="text" maxlength="48" placeholder="例如：张三" required />
+        </div>
+        <div class="field">
+          <label for="visitorContactInput">联系方式（邮箱 / 微信 / 手机，方便离线回联）</label>
+          <input id="visitorContactInput" type="text" maxlength="120" placeholder="例如：hi@example.com" />
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-danger btn-sm" id="resetSessionBtn" type="button" style="margin-right:auto;">新开对话</button>
+          <button class="btn" id="closeProfileBtn" type="button">取消</button>
+          <button class="btn btn-primary" type="submit">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    const STORAGE_KEY = 'chat_rs_visitor_v1';
+
+    const state = {
+      sessionId: null,
+      visitorToken: null,
+      session: null,
+      ownerName: '我',
+      welcomeMessage: '',
+      ownerOnline: false,
+      messages: [],
+      seenIds: new Set(),
+      ws: null,
+      reconnectTimer: null,
+      typingTimer: null,
+      isTypingSent: false,
+    };
+
+    const el = {
+      ownerAvatar: document.getElementById('ownerAvatar'),
+      ownerName: document.getElementById('ownerName'),
+      ownerDot: document.getElementById('ownerDot'),
+      ownerStatusText: document.getElementById('ownerStatusText'),
+      messagesArea: document.getElementById('messagesArea'),
+      typingBar: document.getElementById('typingBar'),
+      quickChips: document.getElementById('quickChips'),
+      composerForm: document.getElementById('composerForm'),
+      msgInput: document.getElementById('msgInput'),
+      sendBtn: document.getElementById('sendBtn'),
+      profileBtn: document.getElementById('profileBtn'),
+      profileModal: document.getElementById('profileModal'),
+      profileForm: document.getElementById('profileForm'),
+      visitorNameInput: document.getElementById('visitorNameInput'),
+      visitorContactInput: document.getElementById('visitorContactInput'),
+      closeProfileBtn: document.getElementById('closeProfileBtn'),
+      resetSessionBtn: document.getElementById('resetSessionBtn'),
+    };
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    function formatTime(iso) {
+      if (!iso) return '';
+      const d = new Date(iso);
+      return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function updateOwnerHeader() {
+      el.ownerName.textContent = state.ownerName;
+      el.ownerAvatar.textContent = state.ownerName.slice(0, 1) || '我';
+      if (state.ownerOnline) {
+        el.ownerDot.classList.add('online');
+        el.ownerStatusText.textContent = '当前在线 · 通常很快回复';
+      } else {
+        el.ownerDot.classList.remove('online');
+        el.ownerStatusText.textContent = '暂时离线 · 留言后我会尽快回复';
+      }
+      if (state.session) {
+        el.profileBtn.textContent = state.session.visitor_name;
+      }
+    }
+
+    function renderMessages() {
+      const items = [];
+      if (state.welcomeMessage) {
+        items.push(`
+          <div class="msg-row incoming">
+            <div class="msg-bubble">${escapeHtml(state.welcomeMessage)}</div>
+            <div class="msg-meta">${escapeHtml(state.ownerName)}</div>
+          </div>
+        `);
+      }
+
+      for (const m of state.messages) {
+        const cls = m.sender === 'visitor' ? 'outgoing' : 'incoming';
+        const label = m.sender === 'visitor' ? '我' : state.ownerName;
+        items.push(`
+          <div class="msg-row ${cls}">
+            <div class="msg-bubble">${escapeHtml(m.content)}</div>
+            <div class="msg-meta">${escapeHtml(label)} · ${formatTime(m.created_at)}</div>
+          </div>
+        `);
+      }
+
+      el.messagesArea.innerHTML = items.join('');
+      el.messagesArea.scrollTop = el.messagesArea.scrollHeight;
+      el.quickChips.style.display = state.messages.length === 0 ? 'flex' : 'none';
+    }
+
+    function appendMessage(msg) {
+      if (state.seenIds.has(msg.id)) return;
+      state.seenIds.add(msg.id);
+      state.messages.push(msg);
+      renderMessages();
+    }
+
+    function loadSavedCredentials() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return null;
+        return JSON.parse(raw);
+      } catch {
+        return null;
+      }
+    }
+
+    function saveCredentials(sessionId, visitorToken) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessionId, visitorToken }));
+    }
+
+    async function createNewSession() {
+      const res = await fetch('/api/visitor/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!res.ok) throw new Error('无法创建会话');
+      const data = await res.json();
+      state.sessionId = data.session.id;
+      state.visitorToken = data.visitor_token;
+      state.session = data.session;
+      state.ownerName = data.owner_name;
+      state.welcomeMessage = data.welcome_message;
+      state.ownerOnline = data.owner_online;
+      state.messages = [];
+      state.seenIds.clear();
+      saveCredentials(state.sessionId, state.visitorToken);
+    }
+
+    async function initSession() {
+      const saved = loadSavedCredentials();
+      if (saved && saved.sessionId && saved.visitorToken) {
+        try {
+          const res = await fetch(`/api/visitor/sessions/${encodeURIComponent(saved.sessionId)}`, {
+            headers: { 'X-Visitor-Token': saved.visitorToken },
+          });
+          if (res.ok) {
+            const data = await res.json();
+            state.sessionId = saved.sessionId;
+            state.visitorToken = saved.visitorToken;
+            state.session = data.session;
+            state.ownerName = data.owner_name;
+            state.welcomeMessage = data.welcome_message;
+            state.ownerOnline = data.owner_online;
+            state.messages = data.messages || [];
+            state.seenIds = new Set(state.messages.map((m) => m.id));
+            updateOwnerHeader();
+            renderMessages();
+            connectWs();
+            return;
+          }
+        } catch (err) {
+          console.warn('恢复历史会话失败，创建新会话', err);
+        }
+      }
+
+      await createNewSession();
+      updateOwnerHeader();
+      renderMessages();
+      connectWs();
+    }
+
+    function connectWs() {
+      if (state.ws) {
+        state.ws.onclose = null;
+        state.ws.close();
+      }
+      clearTimeout(state.reconnectTimer);
+
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${proto}//${location.host}/ws/visitor/${encodeURIComponent(state.sessionId)}?token=${encodeURIComponent(state.visitorToken)}`;
+      const ws = new WebSocket(wsUrl);
+      state.ws = ws;
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'new_message') {
+            appendMessage(data.message);
+            if (data.message.sender === 'owner') {
+              el.typingBar.textContent = '';
+            }
+          } else if (data.type === 'presence') {
+            state.ownerOnline = !!data.owner_online;
+            updateOwnerHeader();
+          } else if (data.type === 'typing' && data.sender === 'owner') {
+            el.typingBar.textContent = data.is_typing ? `${state.ownerName} 正在输入...` : '';
+          }
+        } catch (e) {
+          console.error(e);
+        }
+      };
+
+      ws.onclose = () => {
+        state.reconnectTimer = setTimeout(connectWs, 2500);
+      };
+    }
+
+    async function sendMessage(text) {
+      const content = text.trim();
+      if (!content || !state.sessionId) return;
+
+      el.msgInput.value = '';
+      autoResize();
+      sendTyping(false);
+
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: 'send_message', content }));
+        return;
+      }
+
+      const res = await fetch(`/api/visitor/sessions/${encodeURIComponent(state.sessionId)}/messages`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Visitor-Token': state.visitorToken,
+        },
+        body: JSON.stringify({ content }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        appendMessage(data.message);
+      }
+    }
+
+    function sendTyping(isTyping) {
+      if (state.isTypingSent === isTyping) return;
+      state.isTypingSent = isTyping;
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: 'typing', is_typing: isTyping }));
+      }
+    }
+
+    function syncPlaceholder() {
+      const isDesktop = window.matchMedia('(min-width: 821px) and (pointer: fine)').matches;
+      el.msgInput.placeholder = isDesktop
+        ? '输入消息，按 Enter 发送（Shift+Enter 换行）'
+        : '输入消息...';
+    }
+    syncPlaceholder();
+    window.addEventListener('resize', syncPlaceholder);
+
+    function autoResize() {
+      if (!el.msgInput.value) {
+        el.msgInput.style.height = '';
+        el.msgInput.style.overflowY = 'hidden';
+        return;
+      }
+      el.msgInput.style.height = 'auto';
+      const next = Math.min(el.msgInput.scrollHeight, 130);
+      el.msgInput.style.height = next + 'px';
+      el.msgInput.style.overflowY = el.msgInput.scrollHeight > 130 ? 'auto' : 'hidden';
+    }
+
+    el.composerForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      sendMessage(el.msgInput.value);
+    });
+
+    el.msgInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        sendMessage(el.msgInput.value);
+      }
+    });
+
+    el.msgInput.addEventListener('input', () => {
+      autoResize();
+      sendTyping(true);
+      clearTimeout(state.typingTimer);
+      state.typingTimer = setTimeout(() => sendTyping(false), 1800);
+    });
+
+    el.quickChips.addEventListener('click', (e) => {
+      if (e.target.classList.contains('chip')) {
+        sendMessage(e.target.textContent);
+      }
+    });
+
+    el.profileBtn.addEventListener('click', () => {
+      if (state.session) {
+        el.visitorNameInput.value = state.session.visitor_name || '';
+        el.visitorContactInput.value = state.session.visitor_contact || '';
+      }
+      el.profileModal.classList.remove('hidden');
+    });
+
+    el.closeProfileBtn.addEventListener('click', () => {
+      el.profileModal.classList.add('hidden');
+    });
+
+    el.profileModal.addEventListener('click', (e) => {
+      if (e.target === el.profileModal) el.profileModal.classList.add('hidden');
+    });
+
+    el.profileForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const visitor_name = el.visitorNameInput.value.trim();
+      const visitor_contact = el.visitorContactInput.value.trim();
+      if (!visitor_name) return;
+
+      const res = await fetch(`/api/visitor/sessions/${encodeURIComponent(state.sessionId)}/profile`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Visitor-Token': state.visitorToken,
+        },
+        body: JSON.stringify({ visitor_name, visitor_contact }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        state.session = data.session;
+        updateOwnerHeader();
+        el.profileModal.classList.add('hidden');
+      }
+    });
+
+    el.resetSessionBtn.addEventListener('click', async () => {
+      if (!confirm('确定要开始一个全新的对话吗？当前浏览器的历史记录关联将被重置。')) return;
+      localStorage.removeItem(STORAGE_KEY);
+      el.profileModal.classList.add('hidden');
+      await createNewSession();
+      updateOwnerHeader();
+      renderMessages();
+      connectWs();
+    });
+
+    setInterval(() => {
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 30000);
+
+    initSession().catch((err) => {
+      el.ownerStatusText.textContent = '连接失败，请刷新重试';
+      console.error(err);
+    });
+  </script>
+</body>
+</html>
