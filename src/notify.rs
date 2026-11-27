@@ -76,6 +76,18 @@ impl BarkNotifier {
         self.bark_url.is_some()
     }
 
+    /// Reset per-session Bark notification cooldowns for all sessions (e.g. when admin comes online).
+    pub fn reset_all_cooldowns(&self) {
+        self.cooldown_cache.invalidate_all();
+        tracing::debug!("Reset all Bark notification cooldowns");
+    }
+
+    /// Reset Bark notification cooldown for a specific session (e.g. when admin replies or marks read).
+    pub async fn reset_session_cooldown(&self, session_id: &str) {
+        self.cooldown_cache.invalidate(session_id).await;
+        tracing::debug!(session_id = %session_id, "Reset Bark notification cooldown for session");
+    }
+
     pub async fn notify_offline_message(&self, session: &ChatSession, message: &ChatMessage) {
         let Some(url) = self.bark_url.clone() else {
             return;

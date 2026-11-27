@@ -41,7 +41,7 @@ cargo run
 | `ADMIN_PASSWORD` | `admin123` | `/admin` 登录密码（生产环境请务必修改） |
 | `OWNER_NAME` | `我` | 访客页面展示的你的称呼 |
 | `WELCOME_MESSAGE` | `你好！直接在这里给我发消息...` | 访客进入页面时的欢迎语 |
-| `BARK_URL` | 未配置（关闭） | 后台管理不在线时推送通知的 Bark URL（如 `https://api.day.app/your_key`，同用户 10 分钟内仅通知一次） |
+| `BARK_URL` | 未配置（关闭） | 后台管理不在线时推送通知的 Bark URL（如 `https://api.day.app/your_key`，同用户 10 分钟内仅通知一次，管理员上线后重置冷却） |
 | `PUBLIC_URL` | （可选） | 公网访问根地址（如 `https://chat.example.com`），配置后点击 Bark 通知可直接跳转 `/admin` |
 
 ## 运行测试

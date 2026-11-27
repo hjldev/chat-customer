@@ -131,7 +131,16 @@
       search: '',
       soundEnabled: true,
       ws: null,
+      bootstrapped: false,
+      wsConnectedOnce: false,
+      wsOpenedAt: 0,
       reconnectTimer: null,
+      pongTimer: null,
+      syncRetryTimer: null,
+      syncInFlight: false,
+      syncQueued: false,
+      hiddenAt: 0,
+      lastResumeAt: 0,
       typingTimer: null,
       isTypingSent: false,
     };
@@ -213,7 +222,7 @@
       const headers = Object.assign({}, options.headers || {}, {
         Authorization: `Bearer ${state.token}`,
       });
-      const res = await fetch(url, Object.assign({}, options, { headers }));
+      const res = await fetch(url, Object.assign({ cache: 'no-store' }, options, { headers }));
       if (res.status === 401) {
         handleLogout(false);
         throw new Error('Unauthorized');
@@ -367,61 +376,175 @@
       renderActiveHeader();
     }
 
-    async function selectSession(sessionId) {
-      state.activeSessionId = sessionId;
-      el.typingBar.textContent = '';
-      renderSessionList();
-      renderActiveHeader();
-
+    async function loadSessionMessages(sessionId, { focusInput = false } = {}) {
       const res = await apiFetch(`/api/admin/sessions/${encodeURIComponent(sessionId)}/messages`);
-      if (!res.ok) return;
+      if (!res.ok) return false;
       const data = await res.json();
+      if (state.activeSessionId !== sessionId) return true;
       if (data.session) state.sessions.set(data.session.id, data.session);
       state.messages = data.messages || [];
       state.seenMessageIds = new Set(state.messages.map((m) => m.id));
+      renderSessionList();
       renderActiveHeader();
       renderMessages();
 
       if (data.session && data.session.unread_count > 0) {
         markRead(sessionId);
       }
-      el.replyInput.focus();
+      if (focusInput) {
+        el.replyInput.focus();
+      }
+      return true;
+    }
+
+    function scheduleRetrySync(delayMs = 1500) {
+      clearTimeout(state.syncRetryTimer);
+      if (!state.token) return;
+      state.syncRetryTimer = setTimeout(() => {
+        if (document.visibilityState === 'visible') {
+          syncAdminState();
+        }
+      }, delayMs);
+    }
+
+    async function syncAdminState() {
+      if (!state.token) return;
+      if (state.syncInFlight) {
+        state.syncQueued = true;
+        return;
+      }
+      state.syncInFlight = true;
+      clearTimeout(state.syncRetryTimer);
+      try {
+        await loadSessions();
+        if (state.activeSessionId) {
+          if (state.sessions.has(state.activeSessionId)) {
+            await loadSessionMessages(state.activeSessionId);
+          } else {
+            state.activeSessionId = null;
+            state.messages = [];
+            state.seenMessageIds.clear();
+            renderActiveHeader();
+          }
+        }
+      } catch (err) {
+        if (err && err.message !== 'Unauthorized') {
+          console.warn('同步后台数据失败，稍后重试:', err);
+          scheduleRetrySync();
+        }
+      } finally {
+        state.syncInFlight = false;
+        if (state.syncQueued) {
+          state.syncQueued = false;
+          syncAdminState();
+        }
+      }
+    }
+
+    async function selectSession(sessionId) {
+      const changed = state.activeSessionId !== sessionId;
+      state.activeSessionId = sessionId;
+      el.typingBar.textContent = '';
+      if (changed) {
+        state.messages = [];
+        state.seenMessageIds.clear();
+      }
+      renderSessionList();
+      renderActiveHeader();
+      if (changed) {
+        el.messagesArea.innerHTML = '<div class="empty-list">加载消息中...</div>';
+      }
+
+      try {
+        await loadSessionMessages(sessionId, { focusInput: true });
+      } catch (err) {
+        if (err && err.message !== 'Unauthorized') {
+          console.warn('加载会话消息失败，稍后重试:', err);
+          if (state.activeSessionId === sessionId) {
+            scheduleRetrySync();
+          }
+        }
+      }
     }
 
     async function markRead(sessionId) {
-      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-        state.ws.send(JSON.stringify({ type: 'mark_read', session_id: sessionId }));
-      } else {
-        await apiFetch(`/api/admin/sessions/${encodeURIComponent(sessionId)}/read`, {
-          method: 'POST',
-        });
-      }
-      const s = state.sessions.get(sessionId);
-      if (s) {
-        s.unread_count = 0;
-        renderSessionList();
+      try {
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+          state.ws.send(JSON.stringify({ type: 'mark_read', session_id: sessionId }));
+        } else {
+          await apiFetch(`/api/admin/sessions/${encodeURIComponent(sessionId)}/read`, {
+            method: 'POST',
+          });
+        }
+        const s = state.sessions.get(sessionId);
+        if (s) {
+          s.unread_count = 0;
+          renderSessionList();
+        }
+      } catch (err) {
+        console.warn('标记已读失败:', err);
       }
     }
 
+    function clearPongTimeout() {
+      clearTimeout(state.pongTimer);
+      state.pongTimer = null;
+    }
+
+    function sendPingWithWatchdog(timeoutMs = 5000) {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+      clearPongTimeout();
+      try {
+        state.ws.send(JSON.stringify({ type: 'ping' }));
+      } catch {
+        connectAdminWs();
+        return;
+      }
+      state.pongTimer = setTimeout(() => {
+        if (state.token) {
+          connectAdminWs();
+        }
+      }, timeoutMs);
+    }
+
     function connectAdminWs() {
+      if (!state.token) return;
       if (state.ws) {
+        state.ws.onopen = null;
+        state.ws.onmessage = null;
+        state.ws.onerror = null;
         state.ws.onclose = null;
-        state.ws.close();
+        try {
+          state.ws.close();
+        } catch {}
       }
       clearTimeout(state.reconnectTimer);
+      clearPongTimeout();
 
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${proto}//${location.host}/ws/admin?token=${encodeURIComponent(state.token)}`;
       const ws = new WebSocket(wsUrl);
       state.ws = ws;
+      state.wsOpenedAt = Date.now();
 
       ws.onopen = () => {
+        if (state.ws !== ws) return;
         el.wsDot.classList.add('online');
+        const isReconnect = state.wsConnectedOnce;
+        state.wsConnectedOnce = true;
+        if (isReconnect) {
+          syncAdminState();
+        }
       };
 
       ws.onmessage = (event) => {
+        if (state.ws !== ws) return;
+        clearPongTimeout();
         try {
           const data = JSON.parse(event.data);
+          if (data.type === 'pong') {
+            return;
+          }
           if (data.type === 'new_message') {
             state.sessions.set(data.session.id, data.session);
 
@@ -472,12 +595,49 @@
         }
       };
 
+      ws.onerror = () => {
+        if (state.ws !== ws) return;
+        try {
+          ws.close();
+        } catch {}
+      };
+
       ws.onclose = () => {
+        if (state.ws !== ws) return;
+        clearPongTimeout();
         el.wsDot.classList.remove('online');
         if (state.token) {
           state.reconnectTimer = setTimeout(connectAdminWs, 2500);
         }
       };
+    }
+
+    function handlePageResume(forceReconnect = false) {
+      if (!state.token || !state.bootstrapped) return;
+      const now = Date.now();
+      if (now - state.lastResumeAt < 400) return;
+      state.lastResumeAt = now;
+
+      const hiddenMs = state.hiddenAt ? now - state.hiddenAt : 0;
+      state.hiddenAt = 0;
+
+      // Immediately sync missed sessions & active chat messages from server
+      syncAdminState();
+
+      const ws = state.ws;
+      const isConnectingRecently =
+        ws && ws.readyState === WebSocket.CONNECTING && now - state.wsOpenedAt < 3000;
+      if (isConnectingRecently) return;
+
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        connectAdminWs();
+      } else if (forceReconnect || hiddenMs >= 3000) {
+        // Mobile browsers often leave half-open zombie sockets after screen lock
+        connectAdminWs();
+      } else {
+        // Brief switch: probe socket liveness quickly
+        sendPingWithWatchdog(2500);
+      }
     }
 
     async function sendReply(text) {
@@ -490,8 +650,12 @@
       sendTyping(false);
 
       if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-        state.ws.send(JSON.stringify({ type: 'send_message', session_id: sid, content }));
-        return;
+        try {
+          state.ws.send(JSON.stringify({ type: 'send_message', session_id: sid, content }));
+          return;
+        } catch {
+          // Fall back to HTTP POST below
+        }
       }
 
       const res = await apiFetch(`/api/admin/sessions/${encodeURIComponent(sid)}/messages`, {
@@ -581,6 +745,7 @@
         }
         const data = await res.json();
         state.ownerName = data.owner_name || '我';
+        state.bootstrapped = true;
         showWorkbench();
         await loadSessions();
         connectAdminWs();
@@ -597,13 +762,25 @@
         }).catch(() => {});
       }
       state.token = '';
+      state.bootstrapped = false;
+      state.wsConnectedOnce = false;
+      state.syncQueued = false;
       localStorage.removeItem(TOKEN_KEY);
       if (state.ws) {
+        state.ws.onopen = null;
+        state.ws.onmessage = null;
+        state.ws.onerror = null;
         state.ws.onclose = null;
-        state.ws.close();
+        try {
+          state.ws.close();
+        } catch {}
         state.ws = null;
       }
       clearTimeout(state.reconnectTimer);
+      clearPongTimeout();
+      clearTimeout(state.syncRetryTimer);
+      clearTimeout(state.typingTimer);
+      el.wsDot.classList.remove('online');
       showLogin();
     }
 
@@ -625,6 +802,7 @@
       const data = await res.json();
       state.token = data.token;
       state.ownerName = data.owner_name || '我';
+      state.bootstrapped = true;
       localStorage.setItem(TOKEN_KEY, state.token);
       el.passwordInput.value = '';
       showWorkbench();
@@ -745,11 +923,39 @@
       } catch {}
     });
 
-    setInterval(() => {
-      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-        state.ws.send(JSON.stringify({ type: 'ping' }));
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        state.hiddenAt = Date.now();
+      } else if (document.visibilityState === 'visible') {
+        handlePageResume(false);
       }
-    }, 30000);
+    });
+
+    window.addEventListener('pageshow', (e) => {
+      if (e.persisted) {
+        handlePageResume(true);
+      }
+    });
+
+    window.addEventListener('focus', () => {
+      if (state.hiddenAt > 0 || !state.ws || state.ws.readyState !== WebSocket.OPEN) {
+        handlePageResume(false);
+      }
+    });
+
+    window.addEventListener('online', () => {
+      handlePageResume(true);
+    });
+
+    setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        sendPingWithWatchdog(5000);
+      } else if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        try {
+          state.ws.send(JSON.stringify({ type: 'ping' }));
+        } catch {}
+      }
+    }, 20000);
 
     bootstrapAdmin();
   </script>

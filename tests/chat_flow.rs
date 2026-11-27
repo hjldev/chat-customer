@@ -694,3 +694,330 @@ async fn bark_cooldown_allows_notification_again_after_expiry() {
 
     server_handle.abort();
 }
+
+#[tokio::test]
+async fn bark_cooldown_resets_when_admin_comes_online_and_goes_offline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (bark_tx, mut bark_rx) = mpsc::unbounded_channel::<Value>();
+    let mock_bark = Router::new().route(
+        "/test-bark-reset",
+        post(move |Json(payload): Json<Value>| {
+            let tx = bark_tx.clone();
+            async move {
+                let _ = tx.send(payload);
+                (StatusCode::OK, Json(json!({ "code": 200 })))
+            }
+        }),
+    );
+
+    let bark_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock bark server");
+    let bark_addr = bark_listener.local_addr().unwrap();
+    let bark_handle = tokio::spawn(async move {
+        let _ = axum::serve(bark_listener, mock_bark).await;
+    });
+
+    let db = Database::open_in_memory().expect("open in-memory sqlite");
+    let store = CachedChatStore::new(db);
+    let hub = ChatHub::new();
+    let notifier = BarkNotifier::new(
+        Some(format!("http://{}/test-bark-reset", bark_addr)),
+        None,
+    );
+    let config = Arc::new(AppConfig {
+        owner_name: "主人".to_string(),
+        welcome_message: "你好".to_string(),
+        admin_password: "pass".to_string(),
+    });
+    let app = build_router(AppState {
+        store,
+        hub: hub.clone(),
+        notifier,
+        config,
+    });
+
+    let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind app server");
+    let app_addr = app_listener.local_addr().unwrap();
+    let app_for_server = app.clone();
+    let app_handle = tokio::spawn(async move {
+        let _ = axum::serve(app_listener, app_for_server).await;
+    });
+
+    // Visitor creates session A and session B
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/visitor/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "visitor_name": "访客A" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let init = response_json(resp).await;
+    let sid = init["session"]["id"].as_str().unwrap().to_string();
+    let vtoken = init["visitor_token"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/visitor/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "visitor_name": "访客B" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let init_b = response_json(resp).await;
+    let sid_b = init_b["session"]["id"].as_str().unwrap().to_string();
+    let vtoken_b = init_b["visitor_token"].as_str().unwrap().to_string();
+
+    // 1. Admin offline: visitors A and B send first messages -> Bark fires for both
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/visitor/sessions/{}/messages", sid))
+                .header("content-type", "application/json")
+                .header("x-visitor-token", &vtoken)
+                .body(Body::from(json!({ "content": "第一条离线消息" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let first = tokio::time::timeout(Duration::from_secs(3), bark_rx.recv())
+        .await
+        .expect("expected first bark")
+        .unwrap();
+    assert_eq!(first["body"], "第一条离线消息");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/visitor/sessions/{}/messages", sid_b))
+                .header("content-type", "application/json")
+                .header("x-visitor-token", &vtoken_b)
+                .body(Body::from(json!({ "content": "访客B离线消息" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let first_b = tokio::time::timeout(Duration::from_secs(3), bark_rx.recv())
+        .await
+        .expect("expected first bark for visitor B")
+        .unwrap();
+    assert_eq!(first_b["body"], "访客B离线消息");
+
+    // 2. Same visitor sends second message within 10 min -> throttled
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/visitor/sessions/{}/messages", sid))
+                .header("content-type", "application/json")
+                .header("x-visitor-token", &vtoken)
+                .body(Body::from(json!({ "content": "冷却期内消息" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), bark_rx.recv())
+            .await
+            .is_err(),
+        "should be throttled before admin comes online"
+    );
+
+    // 3. Admin logs in and connects via WebSocket (/ws/admin)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/login")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "password": "pass" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let admin_token = response_json(resp).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut ws_stream = tokio::net::TcpStream::connect(app_addr)
+        .await
+        .expect("connect to app ws");
+    let upgrade_req = format!(
+        "GET /ws/admin?token={} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n",
+        admin_token, app_addr
+    );
+    ws_stream.write_all(upgrade_req.as_bytes()).await.unwrap();
+    let mut buf = [0u8; 512];
+    let n = ws_stream.read(&mut buf).await.unwrap();
+    let resp_head = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        resp_head.starts_with("HTTP/1.1 101"),
+        "expected 101 Switching Protocols, got: {}",
+        resp_head
+    );
+
+    // Wait until hub registers admin online
+    for _ in 0..50 {
+        if hub.is_owner_online().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(hub.is_owner_online().await);
+
+    // Admin replies while online
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/admin/sessions/{}/messages", sid))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", admin_token))
+                .body(Body::from(json!({ "content": "收到，我来回复你" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 4. Admin disconnects (goes offline again)
+    drop(ws_stream);
+    for _ in 0..50 {
+        if !hub.is_owner_online().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!hub.is_owner_online().await);
+
+    // 5. Visitors A (replied) and B (not replied, only WS online/offline) send new messages
+    //    within original 10 min -> Bark MUST fire again for both!
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/visitor/sessions/{}/messages", sid))
+                .header("content-type", "application/json")
+                .header("x-visitor-token", &vtoken)
+                .body(Body::from(json!({ "content": "管理员下线后的新消息" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let after_reset = tokio::time::timeout(Duration::from_secs(3), bark_rx.recv())
+        .await
+        .expect("expected bark notification after admin went online and offline")
+        .unwrap();
+    assert_eq!(after_reset["body"], "管理员下线后的新消息");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/visitor/sessions/{}/messages", sid_b))
+                .header("content-type", "application/json")
+                .header("x-visitor-token", &vtoken_b)
+                .body(Body::from(json!({ "content": "访客B下线后的新消息" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let after_reset_b = tokio::time::timeout(Duration::from_secs(3), bark_rx.recv())
+        .await
+        .expect("expected bark notification for visitor B after admin came online")
+        .unwrap();
+    assert_eq!(after_reset_b["body"], "访客B下线后的新消息");
+
+    // 6. A subsequent message immediately after enters a fresh 10-minute cooldown -> throttled
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/visitor/sessions/{}/messages", sid))
+                .header("content-type", "application/json")
+                .header("x-visitor-token", &vtoken)
+                .body(Body::from(json!({ "content": "新一轮冷却期内消息" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), bark_rx.recv())
+            .await
+            .is_err(),
+        "new cooldown should apply after the post-reset Bark notification"
+    );
+
+    // 7. Even without WS connect, admin REST reply resets cooldown for that session
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/admin/sessions/{}/messages", sid))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", admin_token))
+                .body(Body::from(json!({ "content": "通过接口直接回复" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/visitor/sessions/{}/messages", sid))
+                .header("content-type", "application/json")
+                .header("x-visitor-token", &vtoken)
+                .body(Body::from(json!({ "content": "接口回复后的新消息" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let after_rest_reply = tokio::time::timeout(Duration::from_secs(3), bark_rx.recv())
+        .await
+        .expect("expected bark notification after admin REST reply")
+        .unwrap();
+    assert_eq!(after_rest_reply["body"], "接口回复后的新消息");
+
+    app_handle.abort();
+    bark_handle.abort();
+}

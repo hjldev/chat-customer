@@ -367,6 +367,11 @@ pub async fn admin_send_message(
     session.online = state.hub.is_visitor_online(&session_id).await;
 
     state
+        .notifier
+        .reset_session_cooldown(&session_id)
+        .await;
+
+    state
         .hub
         .broadcast_to_session_and_admins(
             &session_id,
@@ -393,6 +398,11 @@ pub async fn admin_mark_read(
         .await?
         .ok_or_else(|| ApiError::not_found("会话不存在"))?;
     session.online = state.hub.is_visitor_online(&session_id).await;
+
+    state
+        .notifier
+        .reset_session_cooldown(&session_id)
+        .await;
 
     state
         .hub
@@ -601,6 +611,7 @@ async fn handle_admin_socket(socket: WebSocket, state: AppState) {
     let (conn_id, mut rx, owner_became_online) = state.hub.register_admin().await;
 
     if owner_became_online {
+        state.notifier.reset_all_cooldowns();
         state
             .hub
             .send_to_all_visitors(&WsEvent::Presence {
@@ -687,6 +698,7 @@ async fn handle_admin_socket(socket: WebSocket, state: AppState) {
     send_task.abort();
     let owner_became_offline = state.hub.unregister_admin(conn_id).await;
     if owner_became_offline {
+        state.notifier.reset_all_cooldowns();
         state
             .hub
             .send_to_all_visitors(&WsEvent::Presence {

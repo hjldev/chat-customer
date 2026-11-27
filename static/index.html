@@ -80,7 +80,14 @@
       messages: [],
       seenIds: new Set(),
       ws: null,
+      wsConnectedOnce: false,
+      wsOpenedAt: 0,
       reconnectTimer: null,
+      pongTimer: null,
+      syncRetryTimer: null,
+      syncInFlight: false,
+      hiddenAt: 0,
+      lastResumeAt: 0,
       typingTimer: null,
       isTypingSent: false,
     };
@@ -204,6 +211,7 @@
       if (saved && saved.sessionId && saved.visitorToken) {
         try {
           const res = await fetch(`/api/visitor/sessions/${encodeURIComponent(saved.sessionId)}`, {
+            cache: 'no-store',
             headers: { 'X-Visitor-Token': saved.visitorToken },
           });
           if (res.ok) {
@@ -232,21 +240,89 @@
       connectWs();
     }
 
+    async function syncVisitorSession() {
+      if (!state.sessionId || !state.visitorToken || state.syncInFlight) return;
+      state.syncInFlight = true;
+      clearTimeout(state.syncRetryTimer);
+      try {
+        const res = await fetch(`/api/visitor/sessions/${encodeURIComponent(state.sessionId)}`, {
+          cache: 'no-store',
+          headers: { 'X-Visitor-Token': state.visitorToken },
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        state.session = data.session;
+        state.ownerOnline = data.owner_online;
+        state.messages = data.messages || [];
+        state.seenIds = new Set(state.messages.map((m) => m.id));
+        updateOwnerHeader();
+        renderMessages();
+      } catch (err) {
+        console.warn('同步消息失败，稍后重试:', err);
+        state.syncRetryTimer = setTimeout(() => {
+          if (document.visibilityState === 'visible') syncVisitorSession();
+        }, 1500);
+      } finally {
+        state.syncInFlight = false;
+      }
+    }
+
+    function clearPongTimeout() {
+      clearTimeout(state.pongTimer);
+      state.pongTimer = null;
+    }
+
+    function sendPingWithWatchdog(timeoutMs = 5000) {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+      clearPongTimeout();
+      try {
+        state.ws.send(JSON.stringify({ type: 'ping' }));
+      } catch {
+        connectWs();
+        return;
+      }
+      state.pongTimer = setTimeout(() => {
+        if (state.sessionId) connectWs();
+      }, timeoutMs);
+    }
+
     function connectWs() {
+      if (!state.sessionId || !state.visitorToken) return;
       if (state.ws) {
+        state.ws.onopen = null;
+        state.ws.onmessage = null;
+        state.ws.onerror = null;
         state.ws.onclose = null;
-        state.ws.close();
+        try {
+          state.ws.close();
+        } catch {}
       }
       clearTimeout(state.reconnectTimer);
+      clearPongTimeout();
 
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${proto}//${location.host}/ws/visitor/${encodeURIComponent(state.sessionId)}?token=${encodeURIComponent(state.visitorToken)}`;
       const ws = new WebSocket(wsUrl);
       state.ws = ws;
+      state.wsOpenedAt = Date.now();
+
+      ws.onopen = () => {
+        if (state.ws !== ws) return;
+        const isReconnect = state.wsConnectedOnce;
+        state.wsConnectedOnce = true;
+        if (isReconnect) {
+          syncVisitorSession();
+        }
+      };
 
       ws.onmessage = (event) => {
+        if (state.ws !== ws) return;
+        clearPongTimeout();
         try {
           const data = JSON.parse(event.data);
+          if (data.type === 'pong') {
+            return;
+          }
           if (data.type === 'new_message') {
             appendMessage(data.message);
             if (data.message.sender === 'owner') {
@@ -263,9 +339,43 @@
         }
       };
 
+      ws.onerror = () => {
+        if (state.ws !== ws) return;
+        try {
+          ws.close();
+        } catch {}
+      };
+
       ws.onclose = () => {
+        if (state.ws !== ws) return;
+        clearPongTimeout();
         state.reconnectTimer = setTimeout(connectWs, 2500);
       };
+    }
+
+    function handleVisitorResume(forceReconnect = false) {
+      if (!state.sessionId || !state.visitorToken) return;
+      const now = Date.now();
+      if (now - state.lastResumeAt < 400) return;
+      state.lastResumeAt = now;
+
+      const hiddenMs = state.hiddenAt ? now - state.hiddenAt : 0;
+      state.hiddenAt = 0;
+
+      syncVisitorSession();
+
+      const ws = state.ws;
+      const isConnectingRecently =
+        ws && ws.readyState === WebSocket.CONNECTING && now - state.wsOpenedAt < 3000;
+      if (isConnectingRecently) return;
+
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        connectWs();
+      } else if (forceReconnect || hiddenMs >= 3000) {
+        connectWs();
+      } else {
+        sendPingWithWatchdog(2500);
+      }
     }
 
     async function sendMessage(text) {
@@ -397,11 +507,33 @@
       connectWs();
     });
 
-    setInterval(() => {
-      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-        state.ws.send(JSON.stringify({ type: 'ping' }));
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        state.hiddenAt = Date.now();
+      } else if (document.visibilityState === 'visible') {
+        handleVisitorResume(false);
       }
-    }, 30000);
+    });
+
+    window.addEventListener('pageshow', (e) => {
+      if (e.persisted) {
+        handleVisitorResume(true);
+      }
+    });
+
+    window.addEventListener('online', () => {
+      handleVisitorResume(true);
+    });
+
+    setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        sendPingWithWatchdog(5000);
+      } else if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        try {
+          state.ws.send(JSON.stringify({ type: 'ping' }));
+        } catch {}
+      }
+    }, 20000);
 
     initSession().catch((err) => {
       el.ownerStatusText.textContent = '连接失败，请刷新重试';
